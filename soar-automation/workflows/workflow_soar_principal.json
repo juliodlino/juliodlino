@@ -1,0 +1,945 @@
+{
+  "name": "SOAR - Automação de Resposta a Incidentes",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "wazuh-alert",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "webhook-wazuh",
+      "name": "Webhook Wazuh",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [250, 300],
+      "webhookId": "wazuh-soar-webhook"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { \"status\": \"received\", \"alert_id\": $json.id } }}"
+      },
+      "id": "webhook-response",
+      "name": "Webhook Response",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [450, 300]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Parse e enriquece dados do Wazuh\nconst alert = $input.first().json;\n\n// Extrai informações principais\nconst agentName = alert.agent?.name || 'unknown';\nconst agentIP = alert.agent?.ip || 'unknown';\nconst agentId = alert.agent?.id || 'unknown';\nconst ruleId = alert.rule?.id || 'unknown';\nconst ruleDescription = alert.rule?.description || 'No description';\nconst ruleLevel = alert.rule?.level || 0;\nconst timestamp = alert.timestamp || new Date().toISOString();\n\n// Extrai IOCs (Indicators of Compromise)\nconst fileHash = alert.data?.win?.eventdata?.hashes || alert.syscheck?.md5_after || null;\nconst srcIP = alert.data?.srcip || null;\nconst dstIP = alert.data?.dstip || null;\nconst fileName = alert.syscheck?.path || alert.data?.win?.eventdata?.targetFilename || null;\n\n// Define severidade baseado no level do Wazuh\nlet severity = 'LOW';\nif (ruleLevel >= 12) severity = 'CRITICAL';\nelse if (ruleLevel >= 7) severity = 'HIGH';\nelse if (ruleLevel >= 5) severity = 'MEDIUM';\n\n// Determina tipo de ameaça\nlet threatType = 'COMPORTAMENTO';\nif (ruleDescription.toLowerCase().includes('malware') || ruleDescription.toLowerCase().includes('virus')) {\n  threatType = 'MALWARE';\n} else if (ruleDescription.toLowerCase().includes('vulnerab') || ruleDescription.toLowerCase().includes('cve')) {\n  threatType = 'VULNERABILIDADE';\n}\n\n// Gera ID único do incidente\nconst incidentId = `INC-${Date.now()}-${agentId}`;\n\nreturn [{\n  json: {\n    incident_id: incidentId,\n    timestamp: timestamp,\n    asset: {\n      hostname: agentName,\n      ip: agentIP,\n      agent_id: agentId\n    },\n    threat: {\n      type: threatType,\n      severity: severity,\n      rule_id: ruleId,\n      rule_level: ruleLevel,\n      description: ruleDescription,\n      iocs: {\n        file_hash: fileHash,\n        src_ip: srcIP,\n        dst_ip: dstIP,\n        file_name: fileName\n      }\n    },\n    raw_alert: alert\n  }\n}];"
+      },
+      "id": "parse-wazuh-data",
+      "name": "Parse Wazuh Data",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [650, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "string": [
+            {
+              "value1": "={{ $json.threat.iocs.file_hash }}",
+              "operation": "isNotEmpty"
+            }
+          ]
+        }
+      },
+      "id": "check-iocs",
+      "name": "Tem IOCs para consultar?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [850, 300]
+    },
+    {
+      "parameters": {
+        "url": "=https://www.virustotal.com/api/v3/files/{{ $json.threat.iocs.file_hash }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "x-apikey",
+              "value": "={{ $credentials.virusTotalApiKey }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "virustotal-query",
+      "name": "VirusTotal Query",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [1050, 200],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "virustotal-credentials",
+          "name": "VirusTotal API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Combina dados do Wazuh com VirusTotal\nconst wazuhData = $input.first().json;\nconst vtData = $input.all()[1]?.json || null;\n\nlet vtAnalysis = {\n  checked: false,\n  malicious: 0,\n  suspicious: 0,\n  harmless: 0,\n  permalink: null\n};\n\nif (vtData && vtData.data) {\n  const stats = vtData.data.attributes?.last_analysis_stats || {};\n  vtAnalysis = {\n    checked: true,\n    malicious: stats.malicious || 0,\n    suspicious: stats.suspicious || 0,\n    harmless: stats.harmless || 0,\n    undetected: stats.undetected || 0,\n    permalink: `https://www.virustotal.com/gui/file/${wazuhData.threat.iocs.file_hash}`\n  };\n}\n\nreturn [{\n  json: {\n    ...wazuhData,\n    virustotal: vtAnalysis\n  }\n}];"
+      },
+      "id": "merge-vt-data",
+      "name": "Merge VirusTotal Data",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1250, 300]
+    },
+    {
+      "parameters": {
+        "resource": "chat",
+        "operation": "create",
+        "modelId": "gpt-4o-mini",
+        "messages": {
+          "values": [
+            {
+              "role": "system",
+              "content": "={{ $('Load IA Prompt').item.json.system_prompt }}"
+            },
+            {
+              "role": "user",
+              "content": "={{ $('Load IA Prompt').item.json.user_prompt }}"
+            }
+          ]
+        },
+        "options": {
+          "temperature": 0.3,
+          "maxTokens": 1000
+        }
+      },
+      "id": "ia-analysis",
+      "name": "IA Analysis (OpenAI)",
+      "type": "@n8n/n8n-nodes-langchain.openAi",
+      "typeVersion": 1.3,
+      "position": [1650, 300],
+      "credentials": {
+        "openAiApi": {
+          "id": "openai-credentials",
+          "name": "OpenAI API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Carrega e prepara prompts para a IA\nconst data = $input.first().json;\n\nconst systemPrompt = `Você é um Assistente de Análise de Segurança integrado a um sistema SOAR (Security Orchestration, Automation and Response).\n\nSUA FUNÇÃO:\n- Analisar incidentes de segurança detectados pelo Wazuh\n- Fornecer resumo técnico claro e objetivo\n- Sugerir solução de remediação automatizada via script PowerShell\n- Avaliar criticidade e impacto\n\nDIRETRIZES:\n1. Seja conciso e técnico\n2. Priorize soluções não-destrutivas\n3. Considere impacto em produção\n4. Sugira apenas comandos seguros e validáveis\n5. Se não tiver certeza, recomende investigação manual\n6. Retorne SEMPRE em formato JSON válido\n\nFORMATO DE RESPOSTA (JSON):\n{\n  \"resumo\": \"Descrição breve do incidente em 2-3 linhas\",\n  \"analise_tecnica\": \"Análise detalhada do que foi detectado\",\n  \"impacto\": \"CRITICO|ALTO|MEDIO|BAIXO\",\n  \"recomendacao_acao\": \"AUTOMATIZAR|APROVAR_MANUAL|INVESTIGAR|IGNORAR\",\n  \"solucao\": {\n    \"descricao\": \"O que a solução faz\",\n    \"script_type\": \"powershell|bash|python\",\n    \"script\": \"Script completo e seguro\",\n    \"validacao\": \"Como verificar se funcionou\",\n    \"rollback\": \"Como reverter se necessário\"\n  },\n  \"justificativa\": \"Por que esta é a melhor ação\"\n}`;\n\nconst userPrompt = `INCIDENTE DETECTADO:\n\nID: ${data.incident_id}\nTimestamp: ${data.timestamp}\n\nATIVO AFETADO:\n- Hostname: ${data.asset.hostname}\n- IP: ${data.asset.ip}\n- Agent ID: ${data.asset.agent_id}\n\nAMEAÇA:\n- Tipo: ${data.threat.type}\n- Severidade: ${data.threat.severity}\n- Rule ID: ${data.threat.rule_id}\n- Level: ${data.threat.rule_level}\n- Descrição: ${data.threat.description}\n\nIOCs (Indicadores de Comprometimento):\n- Hash do arquivo: ${data.threat.iocs.file_hash || 'N/A'}\n- IP de origem: ${data.threat.iocs.src_ip || 'N/A'}\n- IP de destino: ${data.threat.iocs.dst_ip || 'N/A'}\n- Nome do arquivo: ${data.threat.iocs.file_name || 'N/A'}\n\nVIRUSTOTAL ANALYSIS:\n${data.virustotal.checked ? `\n- Detecções maliciosas: ${data.virustotal.malicious}\n- Suspeitos: ${data.virustotal.suspicious}\n- Link: ${data.virustotal.permalink}\n` : '- Não consultado (sem hash disponível)'}\n\nANALISE E FORNEÇA RESPOSTA EM JSON:`;\n\nreturn [{\n  json: {\n    system_prompt: systemPrompt,\n    user_prompt: userPrompt,\n    incident_data: data\n  }\n}];"
+      },
+      "id": "load-ia-prompt",
+      "name": "Load IA Prompt",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1450, 300]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Parse resposta da IA\nconst incidentData = $('Load IA Prompt').first().json.incident_data;\nconst iaResponse = $input.first().json.message?.content || $input.first().json.choices?.[0]?.message?.content || '';\n\nlet iaParsed;\ntry {\n  // Tenta extrair JSON da resposta\n  const jsonMatch = iaResponse.match(/\\{[\\s\\S]*\\}/);\n  if (jsonMatch) {\n    iaParsed = JSON.parse(jsonMatch[0]);\n  } else {\n    throw new Error('No JSON found in response');\n  }\n} catch (error) {\n  // Fallback se a IA não retornar JSON válido\n  iaParsed = {\n    resumo: iaResponse.substring(0, 200),\n    analise_tecnica: iaResponse,\n    impacto: incidentData.threat.severity,\n    recomendacao_acao: 'INVESTIGAR',\n    solucao: {\n      descricao: 'Erro ao parsear resposta da IA',\n      script_type: 'powershell',\n      script: '# Investigação manual necessária',\n      validacao: 'N/A',\n      rollback: 'N/A'\n    },\n    justificativa: 'Resposta da IA não estava em formato JSON válido'\n  };\n}\n\nreturn [{\n  json: {\n    ...incidentData,\n    ia_analysis: iaParsed,\n    raw_ia_response: iaResponse\n  }\n}];"
+      },
+      "id": "parse-ia-response",
+      "name": "Parse IA Response",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1850, 300]
+    },
+    {
+      "parameters": {
+        "url": "=https://glpi.dlino.us/apirest.php/Ticket",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Session-Token",
+              "value": "={{ $credentials.glpiSessionToken }}"
+            },
+            {
+              "name": "App-Token",
+              "value": "={{ $credentials.glpiAppToken }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "input",
+              "value": "={{ JSON.stringify({\n  name: '[SOAR] ' + $json.threat.type + ' - ' + $json.asset.hostname,\n  content: `<h3>Incidente de Segurança Detectado</h3>\n<p><strong>ID:</strong> ${$json.incident_id}</p>\n<p><strong>Severidade:</strong> ${$json.threat.severity}</p>\n<p><strong>Ativo:</strong> ${$json.asset.hostname} (${$json.asset.ip})</p>\n\n<h4>Ameaça</h4>\n<p>${$json.threat.description}</p>\n\n<h4>Análise da IA</h4>\n<p><strong>Resumo:</strong> ${$json.ia_analysis.resumo}</p>\n<p><strong>Impacto:</strong> ${$json.ia_analysis.impacto}</p>\n<p><strong>Recomendação:</strong> ${$json.ia_analysis.recomendacao_acao}</p>\n\n<h4>Solução Proposta</h4>\n<p>${$json.ia_analysis.solucao.descricao}</p>\n<pre>${$json.ia_analysis.solucao.script}</pre>\n\n${$json.virustotal.checked ? `<h4>VirusTotal</h4>\n<p>Detecções: ${$json.virustotal.malicious}/${$json.virustotal.malicious + $json.virustotal.suspicious + $json.virustotal.harmless}</p>\n<p><a href=\"${$json.virustotal.permalink}\">Ver análise completa</a></p>` : ''}\n\n<p><em>Ticket criado automaticamente pelo sistema SOAR</em></p>`,\n  urgency: $json.threat.severity === 'CRITICAL' ? 5 : ($json.threat.severity === 'HIGH' ? 4 : 3),\n  impact: $json.threat.severity === 'CRITICAL' ? 5 : ($json.threat.severity === 'HIGH' ? 4 : 3),\n  priority: $json.threat.severity === 'CRITICAL' ? 5 : ($json.threat.severity === 'HIGH' ? 4 : 3),\n  status: 2,\n  type: 1,\n  itilcategories_id: 0\n}) }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "create-glpi-ticket",
+      "name": "Create GLPI Ticket",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [2050, 300],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "glpi-credentials",
+          "name": "GLPI API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Prepara dados para envio ao Telegram\nconst incidentData = $('Parse IA Response').first().json;\nconst glpiResponse = $input.first().json;\n\nconst ticketId = glpiResponse.id || 'N/A';\n\nreturn [{\n  json: {\n    ...incidentData,\n    glpi_ticket_id: ticketId,\n    glpi_ticket_url: `https://glpi.dlino.us/front/ticket.form.php?id=${ticketId}`\n  }\n}];"
+      },
+      "id": "prepare-telegram-data",
+      "name": "Prepare Telegram Data",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2250, 300]
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $credentials.telegramChatId }}",
+        "text": "=🚨 *ALERTA DE SEGURANÇA* 🚨\\n\\n*Incidente:* {{ $json.incident_id }}\\n*Severidade:* {{ $json.threat.severity }}\\n*Ativo:* {{ $json.asset.hostname }} ({{ $json.asset.ip }})\\n\\n📋 *Resumo:*\\n{{ $json.ia_analysis.resumo }}\\n\\n🔍 *Análise Técnica:*\\n{{ $json.ia_analysis.analise_tecnica }}\\n\\n💡 *Solução Proposta:*\\n{{ $json.ia_analysis.solucao.descricao }}\\n\\n{{ $json.virustotal.checked ? '🦠 *VirusTotal:* ' + $json.virustotal.malicious + ' detecções\\n' : '' }}📊 *Ticket GLPI:* [#{{ $json.glpi_ticket_id }}]({{ $json.glpi_ticket_url }})\\n\\n⚡ *Deseja aplicar a solução automaticamente?*",
+        "parseMode": "Markdown",
+        "replyMarkup": "inlineKeyboard",
+        "inlineKeyboard": {
+          "rows": [
+            {
+              "buttons": [
+                {
+                  "text": "✅ Aplicar Agora",
+                  "callbackData": "={{ 'approve:' + $json.incident_id }}"
+                },
+                {
+                  "text": "❌ Recusar",
+                  "callbackData": "={{ 'reject:' + $json.incident_id }}"
+                }
+              ]
+            },
+            {
+              "buttons": [
+                {
+                  "text": "🔍 Mais Informações",
+                  "callbackData": "={{ 'info:' + $json.incident_id }}"
+                },
+                {
+                  "text": "🚨 Investigar Manualmente",
+                  "callbackData": "={{ 'manual:' + $json.incident_id }}"
+                }
+              ]
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "send-telegram-alert",
+      "name": "Send Telegram Alert",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.1,
+      "position": [2450, 300],
+      "credentials": {
+        "telegramApi": {
+          "id": "telegram-credentials",
+          "name": "Telegram Bot API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "telegram-callback",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "webhook-telegram-callback",
+      "name": "Webhook Telegram Callback",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [2650, 300],
+      "webhookId": "telegram-callback-webhook"
+    },
+    {
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "OK"
+      },
+      "id": "telegram-callback-response",
+      "name": "Telegram Callback Response",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [2850, 300]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Parse callback do Telegram\nconst callback = $input.first().json;\n\nconst callbackData = callback.callback_query?.data || '';\nconst [action, incidentId] = callbackData.split(':');\n\nconst messageId = callback.callback_query?.message?.message_id;\nconst chatId = callback.callback_query?.message?.chat?.id;\n\nreturn [{\n  json: {\n    action: action,\n    incident_id: incidentId,\n    message_id: messageId,\n    chat_id: chatId,\n    user_id: callback.callback_query?.from?.id,\n    user_name: callback.callback_query?.from?.first_name || 'Unknown'\n  }\n}];"
+      },
+      "id": "parse-telegram-callback",
+      "name": "Parse Telegram Callback",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [3050, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "string": [
+            {
+              "value1": "={{ $json.action }}",
+              "operation": "equals",
+              "value2": "approve"
+            }
+          ]
+        }
+      },
+      "id": "check-approval",
+      "name": "Aprovado?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [3250, 300]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "incident-lookup",
+              "name": "incident_data",
+              "value": "={{ $('Prepare Telegram Data').item.json }}",
+              "type": "object"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "load-incident-data",
+      "name": "Load Incident Data",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.2,
+      "position": [3450, 200]
+    },
+    {
+      "parameters": {
+        "url": "=https://rmm.dlino.us/api/v3/agents/",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "hostname",
+              "value": "={{ $json.incident_data.asset.hostname }}"
+            }
+          ]
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-API-KEY",
+              "value": "={{ $credentials.tacticalRmmApiKey }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "find-rmm-agent",
+      "name": "Find RMM Agent",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [3650, 200],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "tactical-rmm-credentials",
+          "name": "TacticalRMM API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "url": "=https://rmm.dlino.us/api/v3/agents/{{ $json[0].agent_id }}/runscript/",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-API-KEY",
+              "value": "={{ $credentials.tacticalRmmApiKey }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "body",
+              "value": "={{ JSON.stringify({\n  script: $('Load Incident Data').item.json.incident_data.ia_analysis.solucao.script,\n  timeout: 300,\n  args: [],\n  env_vars: {}\n}) }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "execute-remediation",
+      "name": "Execute Remediation via RMM",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [3850, 200],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "tactical-rmm-credentials",
+          "name": "TacticalRMM API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "unit": "seconds",
+        "amount": 30
+      },
+      "id": "wait-for-execution",
+      "name": "Wait for Execution",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1,
+      "position": [4050, 200]
+    },
+    {
+      "parameters": {
+        "url": "=https://rmm.dlino.us/api/v3/agents/{{ $('Find RMM Agent').item.json[0].agent_id }}/jobs/{{ $('Execute Remediation via RMM').item.json.job_id }}/",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-API-KEY",
+              "value": "={{ $credentials.tacticalRmmApiKey }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "check-execution-status",
+      "name": "Check Execution Status",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [4250, 200],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "tactical-rmm-credentials",
+          "name": "TacticalRMM API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "string": [
+            {
+              "value1": "={{ $json.status }}",
+              "operation": "equals",
+              "value2": "success"
+            }
+          ]
+        }
+      },
+      "id": "check-execution-result",
+      "name": "Execução bem-sucedida?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [4450, 200]
+    },
+    {
+      "parameters": {
+        "url": "=https://glpi.dlino.us/apirest.php/Ticket/{{ $('Load Incident Data').item.json.incident_data.glpi_ticket_id }}",
+        "method": "PUT",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Session-Token",
+              "value": "={{ $credentials.glpiSessionToken }}"
+            },
+            {
+              "name": "App-Token",
+              "value": "={{ $credentials.glpiAppToken }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "input",
+              "value": "={{ JSON.stringify({\n  status: 5,\n  solution: `Remediação aplicada automaticamente pelo sistema SOAR.\\n\\nScript executado: ${$('Load Incident Data').item.json.incident_data.ia_analysis.solucao.script_type}\\n\\nResultado: Sucesso\\n\\nOutput: ${$('Check Execution Status').item.json.output || 'N/A'}\\n\\nAplicado por: Sistema SOAR (aprovado por ${$('Parse Telegram Callback').item.json.user_name})`\n}) }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "update-ticket-success",
+      "name": "Update Ticket - Success",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [4650, 100],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "glpi-credentials",
+          "name": "GLPI API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $('Parse Telegram Callback').item.json.chat_id }}",
+        "text": "=✅ *REMEDIAÇÃO BEM-SUCEDIDA*\\n\\n*Incidente:* {{ $('Load Incident Data').item.json.incident_data.incident_id }}\\n*Ativo:* {{ $('Load Incident Data').item.json.incident_data.asset.hostname }}\\n\\n✔️ A solução foi aplicada com sucesso!\\n\\n📊 Ticket GLPI #{{ $('Load Incident Data').item.json.incident_data.glpi_ticket_id }} *FECHADO*\\n\\n*Output:*\\n```\\n{{ $('Check Execution Status').item.json.output || 'Execução concluída sem erros' }}\\n```",
+        "parseMode": "Markdown",
+        "options": {}
+      },
+      "id": "notify-success",
+      "name": "Notify Success",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.1,
+      "position": [4850, 100],
+      "credentials": {
+        "telegramApi": {
+          "id": "telegram-credentials",
+          "name": "Telegram Bot API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "url": "=https://glpi.dlino.us/apirest.php/Ticket/{{ $('Load Incident Data').item.json.incident_data.glpi_ticket_id }}",
+        "method": "PUT",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Session-Token",
+              "value": "={{ $credentials.glpiSessionToken }}"
+            },
+            {
+              "name": "App-Token",
+              "value": "={{ $credentials.glpiAppToken }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "input",
+              "value": "={{ JSON.stringify({\n  status: 2,\n  content: `ATUALIZAÇÃO: Remediação automática FALHOU.\\n\\nErro: ${$('Check Execution Status').item.json.error || 'Status não-sucesso'}\\n\\nOutput: ${$('Check Execution Status').item.json.output || 'N/A'}\\n\\nTicket deixado aberto para tratamento manual.`\n}) }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "update-ticket-failure",
+      "name": "Update Ticket - Failure",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [4650, 300],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "glpi-credentials",
+          "name": "GLPI API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $('Parse Telegram Callback').item.json.chat_id }}",
+        "text": "=❌ *REMEDIAÇÃO FALHOU*\\n\\n*Incidente:* {{ $('Load Incident Data').item.json.incident_data.incident_id }}\\n*Ativo:* {{ $('Load Incident Data').item.json.incident_data.asset.hostname }}\\n\\n⚠️ A solução automática falhou!\\n\\n📊 Ticket GLPI #{{ $('Load Incident Data').item.json.incident_data.glpi_ticket_id }} permanece *ABERTO*\\n\\n*Erro:*\\n```\\n{{ $('Check Execution Status').item.json.error || 'Execução não retornou sucesso' }}\\n```\\n\\n👤 *Ação necessária:* Tratamento manual",
+        "parseMode": "Markdown",
+        "options": {}
+      },
+      "id": "notify-failure",
+      "name": "Notify Failure",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.1,
+      "position": [4850, 300],
+      "credentials": {
+        "telegramApi": {
+          "id": "telegram-credentials",
+          "name": "Telegram Bot API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "url": "=https://glpi.dlino.us/apirest.php/Ticket/{{ $('Prepare Telegram Data').item.json.glpi_ticket_id }}",
+        "method": "PUT",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Session-Token",
+              "value": "={{ $credentials.glpiSessionToken }}"
+            },
+            {
+              "name": "App-Token",
+              "value": "={{ $credentials.glpiAppToken }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "input",
+              "value": "={{ JSON.stringify({\n  status: 4,\n  content: `ATUALIZAÇÃO: Remediação automática RECUSADA pelo usuário ${$('Parse Telegram Callback').item.json.user_name}.\\n\\nAção: ${$('Parse Telegram Callback').item.json.action === 'manual' ? 'Investigação manual solicitada' : 'Remediação recusada'}\\n\\nTicket aguardando tratamento manual.`\n}) }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "update-ticket-rejected",
+      "name": "Update Ticket - Rejected",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [3450, 400],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "glpi-credentials",
+          "name": "GLPI API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $('Parse Telegram Callback').item.json.chat_id }}",
+        "text": "=ℹ️ *AÇÃO REGISTRADA*\\n\\n*Incidente:* {{ $('Parse Telegram Callback').item.json.incident_id }}\\n\\nRemediação automática {{ $('Parse Telegram Callback').item.json.action === 'manual' ? 'dispensada - investigação manual solicitada' : 'recusada' }}.\\n\\nTicket GLPI permanece aberto para tratamento manual.",
+        "parseMode": "Markdown",
+        "options": {}
+      },
+      "id": "notify-rejected",
+      "name": "Notify Rejected",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.1,
+      "position": [3650, 400],
+      "credentials": {
+        "telegramApi": {
+          "id": "telegram-credentials",
+          "name": "Telegram Bot API"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Webhook Wazuh": {
+      "main": [
+        [
+          {
+            "node": "Webhook Response",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Parse Wazuh Data",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Wazuh Data": {
+      "main": [
+        [
+          {
+            "node": "Tem IOCs para consultar?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Tem IOCs para consultar?": {
+      "main": [
+        [
+          {
+            "node": "VirusTotal Query",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Merge VirusTotal Data",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "VirusTotal Query": {
+      "main": [
+        [
+          {
+            "node": "Merge VirusTotal Data",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Merge VirusTotal Data": {
+      "main": [
+        [
+          {
+            "node": "Load IA Prompt",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load IA Prompt": {
+      "main": [
+        [
+          {
+            "node": "IA Analysis (OpenAI)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IA Analysis (OpenAI)": {
+      "main": [
+        [
+          {
+            "node": "Parse IA Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse IA Response": {
+      "main": [
+        [
+          {
+            "node": "Create GLPI Ticket",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create GLPI Ticket": {
+      "main": [
+        [
+          {
+            "node": "Prepare Telegram Data",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Telegram Data": {
+      "main": [
+        [
+          {
+            "node": "Send Telegram Alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Webhook Telegram Callback": {
+      "main": [
+        [
+          {
+            "node": "Telegram Callback Response",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Parse Telegram Callback",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Telegram Callback": {
+      "main": [
+        [
+          {
+            "node": "Aprovado?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Aprovado?": {
+      "main": [
+        [
+          {
+            "node": "Load Incident Data",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Update Ticket - Rejected",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load Incident Data": {
+      "main": [
+        [
+          {
+            "node": "Find RMM Agent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Find RMM Agent": {
+      "main": [
+        [
+          {
+            "node": "Execute Remediation via RMM",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Execute Remediation via RMM": {
+      "main": [
+        [
+          {
+            "node": "Wait for Execution",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wait for Execution": {
+      "main": [
+        [
+          {
+            "node": "Check Execution Status",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check Execution Status": {
+      "main": [
+        [
+          {
+            "node": "Execução bem-sucedida?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Execução bem-sucedida?": {
+      "main": [
+        [
+          {
+            "node": "Update Ticket - Success",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Update Ticket - Failure",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Update Ticket - Success": {
+      "main": [
+        [
+          {
+            "node": "Notify Success",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Update Ticket - Failure": {
+      "main": [
+        [
+          {
+            "node": "Notify Failure",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Update Ticket - Rejected": {
+      "main": [
+        [
+          {
+            "node": "Notify Rejected",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "staticData": null,
+  "tags": [],
+  "triggerCount": 2,
+  "updatedAt": "2025-10-27T00:00:00.000Z",
+  "versionId": "1"
+}
