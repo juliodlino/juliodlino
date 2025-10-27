@@ -1,0 +1,35 @@
+# Credenciais (NUNCA commite!)
+configs/credentials.env
+*.env
+!credentials.example.env
+
+# Logs
+*.log
+logs/
+
+# Evidências
+Evidence/
+*.zip
+
+# Quarentena
+Quarantine/
+
+# Backups
+Backups/
+*.wfw
+*.bak
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Temporários
+tmp/
+temp/
