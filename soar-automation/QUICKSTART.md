@@ -75,6 +75,29 @@ curl -X POST https://glpi.dlino.us/apirest.php/initSession \
 2. **Workflows** → **Import from File**
 3. Selecione: `workflows/workflow_soar_principal.json`
 
+### ⚠️ CORRIGIR NÓ DE IA (IMPORTANTE!)
+
+O workflow usa OpenAI (pago). **OBRIGATÓRIO corrigir para IA gratuita:**
+
+**Opção Recomendada: Groq (5 min)**
+
+1. Obtenha API Key: https://console.groq.com/ → API Keys → Create
+2. No n8n: Settings → Credentials → Add → HTTP Header Auth
+   - Name: `Groq API`
+   - Header: `Authorization`
+   - Value: `Bearer gsk_sua_key`
+3. No workflow: DELETE o nó "IA Analysis (OpenAI)"
+4. Adicione HTTP Request:
+   - URL: `https://api.groq.com/openai/v1/chat/completions`
+   - Method: POST
+   - Auth: Groq API
+   - Body: Ver [docs/CORRIGIR-WORKFLOW.md](docs/CORRIGIR-WORKFLOW.md)
+5. Conecte: Load IA Prompt → IA Analysis → Parse
+
+**📖 Guia Completo:** [docs/CORRIGIR-WORKFLOW.md](docs/CORRIGIR-WORKFLOW.md)
+
+**Alternativas:** Ollama (local) ou Gemini (grátis)
+
 ### Configurar Credenciais
 
 **Settings → Credentials → Add Credential**
@@ -99,11 +122,7 @@ curl -X POST https://glpi.dlino.us/apirest.php/initSession \
 - Header Name: `X-API-KEY`
 - Header Value: `sua-tactical-api-key`
 
-#### 4. OpenAI
-- Tipo: **OpenAI**
-- API Key: `sk-sua-key`
-
-#### 5. Telegram
+#### 4. Telegram
 - Tipo: **Telegram**
 - Bot Token: `123456:ABC...`
 - Em "Additional Fields" → Chat ID: `seu-chat-id`

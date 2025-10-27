@@ -2,6 +2,10 @@
 
 Sistema completo de **Security Orchestration, Automation and Response** integrado com Wazuh, n8n, GLPI, TacticalRMM e Telegram.
 
+> ⚠️ **IMPORTANTE:** Após importar o workflow, você precisa corrigir o nó de IA que usa OpenAI (pago).
+> 📖 **Guia de Correção:** [docs/CORRIGIR-WORKFLOW.md](docs/CORRIGIR-WORKFLOW.md)
+> 🚀 **Recomendado:** Use **Groq** (gratuito e extremamente rápido) - setup em 5 minutos!
+
 ## 📋 Índice
 
 - [Visão Geral](#visão-geral)
